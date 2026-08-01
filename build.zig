@@ -37,6 +37,8 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
+    const pg_module = b.dependency("pg", .{}).module("pg");
+
     const exe = b.addExecutable(.{
         .name = "zpg",
         .root_module = b.createModule(.{
@@ -50,6 +52,9 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pg", .module = pg_module },
+            },
         }),
     });
 
