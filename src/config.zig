@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 
 pub const Mode = enum {
@@ -162,6 +163,21 @@ pub const Config = struct {
         return config;
     }
 };
+
+pub fn getTestConfig(allocator: std.mem.Allocator) !Config {
+    comptime {
+        if (!builtin.is_test) {
+            @compileError("getTestConfig is test-only and cannot be used in production code!");
+        }
+    }
+
+    const dummy_args = std.process.Args{
+        .vector = &[_][*:0]const u8{"zpg_test"},
+    };
+    var real_env = std.process.Environ.Map.init(allocator);
+    defer real_env.deinit();
+    return try Config.load(dummy_args, &real_env);
+}
 
 test "config loads default values" {
     const dummy_args = std.process.Args{

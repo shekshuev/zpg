@@ -13,6 +13,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // TODO: for testing purpose, remove later
+    //
 
     {
         var result = try client.execute("SELECT * FROM accounts");
@@ -21,7 +22,25 @@ pub fn main(init: std.process.Init) !void {
     }
 
     {
+        var result = try client.execute(
+            \\SELECT
+            \\    '192.168.1.50/24'::inet as ipv4_inet,
+            \\    '192.168.1.0/24'::cidr as ipv4_cidr,
+            \\    '2001:db8:85a3::8a2e:370:7334/64'::inet as ipv6_inet,
+            \\    '2001:db8:85a3::/64'::cidr as ipv6_cidr
+        );
+        defer result.deinit();
+        printQueryResult(result);
+    }
+
+    {
         var result = try client.execute("UPDATE accounts SET updated_at = NOW() WHERE id = 1");
+        defer result.deinit();
+        printQueryResult(result);
+    }
+
+    {
+        var result = try client.execute("UPDATE accounts SET updated_at = NOW() WHERE id = 1 returning id, type, status, updated_at");
         defer result.deinit();
         printQueryResult(result);
     }
@@ -69,4 +88,5 @@ fn printQueryResult(result: QueryResult) void {
 
 test {
     _ = @import("config.zig");
+    _ = @import("db/client.zig");
 }

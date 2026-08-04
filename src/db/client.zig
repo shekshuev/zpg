@@ -1,21 +1,26 @@
 const std = @import("std");
 const pg = @import("pg");
-const Config = @import("../config.zig").Config;
+const builtin = @import("builtin");
+const testing = std.testing;
+
+const config = @import("../config.zig");
+const Config = config.Config;
 const QueryResult = @import("result.zig").QueryResult;
+const Oid = @import("oids.zig").Oid;
 
 pub const Client = struct {
     pool: *pg.Pool,
     allocator: std.mem.Allocator,
     io: std.Io,
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config) !Client {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, cfg: Config) !Client {
         const pool = try pg.Pool.init(io, allocator, .{ .size = 5, .connect_on_init_count = 1, .connect = .{
-            .port = config.db_port,
-            .host = config.db_host,
+            .port = cfg.db_port,
+            .host = cfg.db_host,
         }, .auth = .{
-            .username = config.db_user,
-            .database = config.db_name,
-            .password = config.db_pass,
+            .username = cfg.db_user,
+            .database = cfg.db_name,
+            .password = cfg.db_pass,
             .timeout = 10_000,
         } });
 
@@ -78,11 +83,7 @@ pub const Client = struct {
             while (try result.next()) |row| {
                 var cells = try allocator.alloc([]const u8, cols.len);
                 for (0..cols.len) |col_idx| {
-                    if (row.get([]const u8, col_idx) catch null) |value| {
-                        cells[col_idx] = try allocator.dupe(u8, value);
-                    } else {
-                        cells[col_idx] = "[NULL]";
-                    }
+                    cells[col_idx] = try cellToString(allocator, row, col_idx);
                 }
                 try rows.append(allocator, cells);
             }
@@ -110,4 +111,163 @@ pub const Client = struct {
             },
         };
     }
+
+    fn cellToString(allocator: std.mem.Allocator, row: pg.Row, col_idx: usize) ![]const u8 {
+        if (row.values[col_idx].is_null) {
+            return "[NULL]";
+        }
+
+        const oid: Oid = @enumFromInt(row.oids[col_idx]);
+        return switch (oid) {
+            .char, .name, .text, .xml, .bpchar, .varchar, .json, .jsonb => {
+                const str = try row.get([]const u8, col_idx);
+                return try allocator.dupe(u8, str);
+            },
+            .bool => {
+                const value = try row.get(bool, col_idx);
+                return if (value) "true" else "false";
+            },
+            .int2 => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(i16, col_idx)}),
+            .int4 => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(i32, col_idx)}),
+            .int8 => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(i64, col_idx)}),
+            .float4 => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(f32, col_idx)}),
+            .float8, .numeric => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(f64, col_idx)}),
+            .uuid => {
+                const str = try row.get([]const u8, col_idx);
+                const uuid = try pg.uuidToHex(str);
+                return try allocator.dupe(u8, &uuid);
+            },
+            .inet, .cidr => {
+                const addr = try row.get(pg.Cidr, col_idx);
+                return formatCidr(allocator, addr);
+            },
+            _ => {
+                return try std.fmt.allocPrint(allocator, "[OID {d}]", .{oid});
+            },
+        };
+    }
+
+    fn formatCidr(allocator: std.mem.Allocator, cidr: pg.Cidr) ![]const u8 {
+        if (cidr.family == .v4) {
+            const a = cidr.address;
+            return try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}/{d}", .{
+                a[0], a[1], a[2], a[3], cidr.netmask,
+            });
+        } else {
+            var g: [8]u16 = undefined;
+            for (0..8) |i| {
+                const first = @as(u16, cidr.address[i * 2]);
+                const second = @as(u16, cidr.address[i * 2 + 1]);
+                g[i] = (first << 8) | second;
+            }
+            return try std.fmt.allocPrint(
+                allocator,
+                "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}/{d}",
+                .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], cidr.netmask },
+            );
+        }
+    }
 };
+
+pub fn setupTestClient(allocator: std.mem.Allocator, io: std.Io) !Client {
+    const cfg = try config.getTestConfig(allocator);
+    var client = try Client.init(io, allocator, cfg);
+    errdefer client.deinit();
+
+    const connected = try client.checkConnection();
+    try testing.expect(connected);
+
+    return client;
+}
+
+test "should avoid memory leak" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT 'test'::text, 123::int4");
+    res.deinit();
+}
+
+// bools
+
+test "should return true on true value and false on false" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT true, false");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("true", sel.rows[0][0]);
+    try testing.expectEqualStrings("false", sel.rows[0][1]);
+}
+
+test "should correctly process casting null to bool" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::bool");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// integers
+
+test "should return integers values as strings" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\ 123::int2, 65536::int4, 726361236123::int8,
+        \\ 123::smallint, 65536::int, 726361236123::bigint
+    );
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("123", sel.rows[0][0]);
+    try testing.expectEqualStrings("65536", sel.rows[0][1]);
+    try testing.expectEqualStrings("726361236123", sel.rows[0][2]);
+    try testing.expectEqualStrings("123", sel.rows[0][3]);
+    try testing.expectEqualStrings("65536", sel.rows[0][4]);
+    try testing.expectEqualStrings("726361236123", sel.rows[0][5]);
+}
+
+test "should correctly process integers borders values as strings" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\ (-32768)::int2, 32767::int2,
+        \\ (-2147483648)::int4, 2147483647::int4,
+        \\ (-9223372036854775808)::int8, 9223372036854775807::int8
+    );
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("-32768", sel.rows[0][0]);
+    try testing.expectEqualStrings("32767", sel.rows[0][1]);
+    try testing.expectEqualStrings("-2147483648", sel.rows[0][2]);
+    try testing.expectEqualStrings("2147483647", sel.rows[0][3]);
+    try testing.expectEqualStrings("-9223372036854775808", sel.rows[0][4]);
+    try testing.expectEqualStrings("9223372036854775807", sel.rows[0][5]);
+}
+
+test "should correctly process casting null to int" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::int");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
