@@ -130,8 +130,20 @@ pub const Client = struct {
             .int2 => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(i16, col_idx)}),
             .int4 => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(i32, col_idx)}),
             .int8 => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(i64, col_idx)}),
-            .float4 => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(f32, col_idx)}),
-            .float8, .numeric => try std.fmt.allocPrint(allocator, "{d}", .{try row.get(f64, col_idx)}),
+            .float4 => {
+                const value = try row.get(f32, col_idx);
+                return formatFloat(f32, allocator, value);
+            },
+            .float8 => {
+                const value = try row.get(f64, col_idx);
+                return formatFloat(f64, allocator, value);
+            },
+            .numeric => {
+                const value = try row.get(pg.Numeric, col_idx);
+                const size = value.estimatedStringLen();
+                const buf = try allocator.alloc(u8, size);
+                return value.toString(buf);
+            },
             .uuid => {
                 const str = try row.get([]const u8, col_idx);
                 const uuid = try pg.uuidToHex(str);
@@ -145,6 +157,18 @@ pub const Client = struct {
                 return try std.fmt.allocPrint(allocator, "[OID {d}]", .{oid});
             },
         };
+    }
+
+    fn formatFloat(comptime T: type, allocator: std.mem.Allocator, value: T) ![]const u8 {
+        const abs_val = @abs(value);
+
+        if ((abs_val >= 1e15 or (abs_val > 0 and abs_val < 1e-4)) and
+            !std.math.isInf(value) and !std.math.isNan(value))
+        {
+            return std.fmt.allocPrint(allocator, "{e}", .{value});
+        }
+
+        return std.fmt.allocPrint(allocator, "{d}", .{value});
     }
 
     fn formatCidr(allocator: std.mem.Allocator, cidr: pg.Cidr) ![]const u8 {
@@ -265,6 +289,159 @@ test "should correctly process casting null to int" {
     defer client.deinit();
 
     var res = try client.execute("SELECT null::int");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// floats
+
+test "should return float values as strings" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\ 3.14159::float4,
+        \\ 2.718281828459045::float8,
+        \\ 3.14159::float,
+        \\ 2.718281828459045::double precision
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("3.14159", sel.rows[0][0]);
+    try testing.expectEqualStrings("2.718281828459045", sel.rows[0][1]);
+    try testing.expectEqualStrings("3.14159", sel.rows[0][2]);
+    try testing.expectEqualStrings("2.718281828459045", sel.rows[0][3]);
+}
+
+test "should correctly process float borders and special values as strings" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '3.4028235e38'::float4,
+        \\    '-3.4028235e38'::float4,
+        \\    '1.7976931348623157e308'::float8,
+        \\    '-1.7976931348623157e308'::float8,
+        \\    'Infinity'::float4,
+        \\    '-Infinity'::float4,
+        \\    'NaN'::float4
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("3.4028235e38", sel.rows[0][0]);
+    try testing.expectEqualStrings("-3.4028235e38", sel.rows[0][1]);
+    try testing.expectEqualStrings("1.7976931348623157e308", sel.rows[0][2]);
+    try testing.expectEqualStrings("-1.7976931348623157e308", sel.rows[0][3]);
+    try testing.expectEqualStrings("inf", sel.rows[0][4]);
+    try testing.expectEqualStrings("-inf", sel.rows[0][5]);
+    try testing.expectEqualStrings("nan", sel.rows[0][6]);
+}
+
+test "should switch between scientific and decimal notation based on thresholds" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    0.0001::float8,
+        \\    0.00001::float8,
+        \\    100000000000000::float8,
+        \\    1000000000000000::float8,
+        \\    0.0::float8,
+        \\    -0.00005::float4
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("0.0001", sel.rows[0][0]);
+    try testing.expectEqualStrings("1e-5", sel.rows[0][1]);
+    try testing.expectEqualStrings("100000000000000", sel.rows[0][2]);
+    try testing.expectEqualStrings("1e15", sel.rows[0][3]);
+    try testing.expectEqualStrings("0", sel.rows[0][4]);
+    try testing.expectEqualStrings("-5e-5", sel.rows[0][5]);
+}
+
+test "should correctly process casting null to float" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::float");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// numeric
+
+test "should return numeric values as strings" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\ 3.14159::numeric,
+        \\ 2.718281828459045235360287471352::numeric,
+        \\ 2.718281828459045235360287471352::numeric(21,20)
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("3.14159", sel.rows[0][0]);
+    try testing.expectEqualStrings("2.718281828459045235360287471352", sel.rows[0][1]);
+    try testing.expectEqualStrings("2.71828182845904523536", sel.rows[0][2]);
+}
+
+test "should handle complex numeric cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    123456789012345678901234567890.12345678901234567890::numeric,
+        \\    -98765432109876543210.98765432109876543210::numeric,
+        //    \\    0.00000000000000000000000000000000000000000000000001::numeric,
+        \\    0.0001::numeric,
+        \\    123.4567::numeric(10, 2),
+        \\    'NaN'::numeric,
+        \\    'Infinity'::numeric,
+        \\    '-Infinity'::numeric
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("123456789012345678901234567890.12345678901234567890", sel.rows[0][0]);
+    try testing.expectEqualStrings("-98765432109876543210.98765432109876543210", sel.rows[0][1]);
+    try testing.expectEqualStrings("0.0001", sel.rows[0][2]);
+    try testing.expectEqualStrings("123.46", sel.rows[0][3]);
+    try testing.expectEqualStrings("nan", sel.rows[0][4]);
+    try testing.expectEqualStrings("inf", sel.rows[0][5]);
+    try testing.expectEqualStrings("-inf", sel.rows[0][6]);
+}
+
+test "should correctly process casting null to numeric" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::numeric");
     defer res.deinit();
 
     const sel = res.payload.select;
