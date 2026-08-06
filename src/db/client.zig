@@ -151,7 +151,7 @@ pub const Client = struct {
             },
             .inet, .cidr => {
                 const addr = try row.get(pg.Cidr, col_idx);
-                return formatCidr(allocator, addr);
+                return formatCidr(allocator, addr, oid);
             },
             _ => {
                 return try std.fmt.allocPrint(allocator, "[OID {d}]", .{oid});
@@ -171,29 +171,78 @@ pub const Client = struct {
         return std.fmt.allocPrint(allocator, "{d}", .{value});
     }
 
-    fn formatCidr(allocator: std.mem.Allocator, cidr: pg.Cidr) ![]const u8 {
+    fn formatCidr(allocator: std.mem.Allocator, cidr: pg.Cidr, oid: Oid) ![]const u8 {
+        var buf: [64]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+
+        const max_mask: u8 = if (cidr.family == .v4) 32 else 128;
+        const show_mask = (oid == .cidr) or (cidr.netmask != max_mask);
+
         if (cidr.family == .v4) {
             const a = cidr.address;
-            return try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}/{d}", .{
-                a[0], a[1], a[2], a[3], cidr.netmask,
-            });
+            if (show_mask) {
+                try writer.print("{d}.{d}.{d}.{d}/{d}", .{ a[0], a[1], a[2], a[3], cidr.netmask });
+            } else {
+                try writer.print("{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] });
+            }
         } else {
-            var g: [8]u16 = undefined;
+            var words: [8]u16 = undefined;
             for (0..8) |i| {
                 const first = @as(u16, cidr.address[i * 2]);
                 const second = @as(u16, cidr.address[i * 2 + 1]);
-                g[i] = (first << 8) | second;
+                words[i] = (first << 8) | second;
             }
-            return try std.fmt.allocPrint(
-                allocator,
-                "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}/{d}",
-                .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], cidr.netmask },
-            );
+
+            var best_start: usize = 0;
+            var best_len: usize = 0;
+            var cur_start: usize = 0;
+            var cur_len: usize = 0;
+
+            for (words, 0..) |w, i| {
+                if (w == 0) {
+                    if (cur_len == 0) cur_start = i;
+                    cur_len += 1;
+                    if (cur_len > best_len) {
+                        best_start = cur_start;
+                        best_len = cur_len;
+                    }
+                } else {
+                    cur_len = 0;
+                }
+            }
+
+            if (best_len < 2) best_len = 0;
+
+            var i: usize = 0;
+            var needs_colon = false;
+            while (i < 8) : (i += 1) {
+                if (best_len > 0 and i == best_start) {
+                    try writer.writeAll("::");
+                    i += best_len - 1;
+                    needs_colon = false;
+                } else {
+                    if (needs_colon) try writer.writeByte(':');
+                    try writer.print("{x}", .{words[i]});
+                    needs_colon = true;
+                }
+            }
+
+            if (show_mask) {
+                try writer.print("/{d}", .{cidr.netmask});
+            }
         }
+
+        return allocator.dupe(u8, writer.buffered());
     }
 };
 
 pub fn setupTestClient(allocator: std.mem.Allocator, io: std.Io) !Client {
+    comptime {
+        if (!builtin.is_test) {
+            @compileError("setupTestClient is test-only and cannot be used in production code!");
+        }
+    }
+
     const cfg = try config.getTestConfig(allocator);
     var client = try Client.init(io, allocator, cfg);
     errdefer client.deinit();
@@ -202,6 +251,24 @@ pub fn setupTestClient(allocator: std.mem.Allocator, io: std.Io) !Client {
     try testing.expect(connected);
 
     return client;
+}
+
+fn isValidUuid(str: []const u8) bool {
+    comptime {
+        if (!builtin.is_test) {
+            @compileError("isValidUuid is test-only and cannot be used in production code!");
+        }
+    }
+
+    if (str.len != 36) return false;
+
+    for (str, 0..) |c, i| {
+        switch (i) {
+            8, 13, 18, 23 => if (c != '-') return false,
+            else => if (!std.ascii.isHex(c)) return false,
+        }
+    }
+    return true;
 }
 
 test "should avoid memory leak" {
@@ -452,4 +519,122 @@ test "should correctly process casting null to numeric" {
     const sel = res.payload.select;
 
     try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// uuid
+
+test "should return uuid value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", sel.rows[0][0]);
+}
+
+test "should handle complex uuid cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '00000000-0000-0000-0000-000000000000'::uuid,
+        \\    'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid,
+        \\    'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid,
+        \\    'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid,
+        \\    '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid,
+        \\    gen_random_uuid()
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", sel.rows[0][0]);
+    try testing.expectEqualStrings("ffffffff-ffff-ffff-ffff-ffffffffffff", sel.rows[0][1]);
+    try testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", sel.rows[0][2]);
+    try testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", sel.rows[0][3]);
+    try testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", sel.rows[0][4]);
+    try testing.expect(isValidUuid(sel.rows[0][5]));
+}
+
+test "should correctly process casting null to uuid" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::uuid");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// cidr and inet
+
+test "should return cidr and inet values as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT '192.168.1.1/24'::inet, '192.168.1.0/24'::cidr
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("192.168.1.1/24", sel.rows[0][0]);
+    try testing.expectEqualStrings("192.168.1.0/24", sel.rows[0][1]);
+}
+
+test "should handle complex cird and inet cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '192.168.1.0/24'::cidr,
+        \\    '10.0.0.0/8'::inet,
+        \\    '192.168.1.1'::inet,
+        \\    '192.168.1.0'::cidr,
+        \\    '2001:db8::1/64'::inet,
+        \\    '::1/128'::inet,
+        \\    '0.0.0.0/0'::cidr,
+        \\    '::/0'::cidr,
+        \\    '255.255.255.255/32'::inet
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("192.168.1.0/24", sel.rows[0][0]);
+    try testing.expectEqualStrings("10.0.0.0/8", sel.rows[0][1]);
+    try testing.expectEqualStrings("192.168.1.1", sel.rows[0][2]);
+    try testing.expectEqualStrings("192.168.1.0/32", sel.rows[0][3]);
+    try testing.expectEqualStrings("2001:db8::1/64", sel.rows[0][4]);
+    try testing.expectEqualStrings("::1", sel.rows[0][5]);
+    try testing.expectEqualStrings("0.0.0.0/0", sel.rows[0][6]);
+    try testing.expectEqualStrings("::/0", sel.rows[0][7]);
+    try testing.expectEqualStrings("255.255.255.255", sel.rows[0][8]);
+}
+
+test "should correctly process casting null to cidr and inet" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::cidr, null::inet");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][1]);
 }
