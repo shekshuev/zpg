@@ -416,17 +416,14 @@ test "should handle complex numeric cases" {
         \\ SELECT
         \\    123456789012345678901234567890.12345678901234567890::numeric,
         \\    -98765432109876543210.98765432109876543210::numeric,
-        // TODO: return after bug will be fixed https://github.com/karlseguin/pg.zig/pull/128
-        // \\    0.00000000000000000000000000000000000000000000000001::numeric,
-        \\    0.0001::numeric,
+        \\    0.00000000000000000000000000000000000000000000000001::numeric,
         \\    123.4567::numeric(10, 2),
         \\    'NaN'::numeric,
         \\    'Infinity'::numeric,
         \\    '-Infinity'::numeric,
         \\    -0.1234::numeric,
-        // TODO: return after bug will be fixed https://github.com/karlseguin/pg.zig/pull/128
-        // \\    0::numeric,
-        // \\    1000000000000000000000000000::numeric
+        \\    0::numeric,
+        \\    1000000000000000000000000000::numeric
     );
     defer res.deinit();
 
@@ -435,17 +432,14 @@ test "should handle complex numeric cases" {
 
     try testing.expectEqualStrings("123456789012345678901234567890.12345678901234567890", sel.rows[0][0]);
     try testing.expectEqualStrings("-98765432109876543210.98765432109876543210", sel.rows[0][1]);
-    // TODO: return after bug will be fixed https://github.com/karlseguin/pg.zig/pull/128
-    // try testing.expectEqualStrings("0.00000000000000000000000000000000000000000000000001", sel.rows[0][2]);
-    try testing.expectEqualStrings("0.0001", sel.rows[0][2]);
+    try testing.expectEqualStrings("0.00000000000000000000000000000000000000000000000001", sel.rows[0][2]);
     try testing.expectEqualStrings("123.46", sel.rows[0][3]);
     try testing.expectEqualStrings("nan", sel.rows[0][4]);
     try testing.expectEqualStrings("inf", sel.rows[0][5]);
     try testing.expectEqualStrings("-inf", sel.rows[0][6]);
     try testing.expectEqualStrings("-0.1234", sel.rows[0][7]);
-    // TODO: return after bug will be fixed https://github.com/karlseguin/pg.zig/pull/128
-    // try testing.expectEqualStrings("0", sel.rows[0][8]);
-    // try testing.expectEqualStrings("1000000000000000000000000000", sel.rows[0][9]);
+    try testing.expectEqualStrings("0", sel.rows[0][8]);
+    try testing.expectEqualStrings("1000000000000000000000000000", sel.rows[0][9]);
 }
 
 test "should correctly process casting null to numeric" {
