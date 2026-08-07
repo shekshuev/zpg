@@ -3,8 +3,7 @@ const pg = @import("pg");
 const builtin = @import("builtin");
 const testing = std.testing;
 
-const config = @import("../config.zig");
-const Config = config.Config;
+const ConnectOptions = @import("option.zig").ConnectOptions;
 const QueryResult = @import("result.zig").QueryResult;
 const Oid = @import("oids.zig").Oid;
 
@@ -28,14 +27,14 @@ pub const Client = struct {
     io: std.Io,
     session_context: SessionContext,
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, cfg: Config) !Client {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, opts: ConnectOptions) !Client {
         const pool = try pg.Pool.init(io, allocator, .{ .size = 5, .connect_on_init_count = 1, .connect = .{
-            .port = cfg.db_port,
-            .host = cfg.db_host,
+            .port = opts.port,
+            .host = opts.host,
         }, .auth = .{
-            .username = cfg.db_user,
-            .database = cfg.db_name,
-            .password = cfg.db_pass,
+            .username = opts.user,
+            .database = opts.database,
+            .password = opts.pass,
             .timeout = 10_000,
         } });
 
@@ -508,8 +507,7 @@ pub fn setupTestClient(allocator: std.mem.Allocator, io: std.Io) !Client {
         }
     }
 
-    const cfg = try config.getTestConfig(allocator);
-    var client = try Client.init(io, allocator, cfg);
+    var client = try Client.init(io, allocator, .{});
     errdefer client.deinit();
 
     const connected = try client.checkConnection();

@@ -1,11 +1,19 @@
 const std = @import("std");
+const zpg = @import("core");
 const Config = @import("config.zig").Config;
-const Client = @import("db/client.zig").Client;
-const QueryResult = @import("db/result.zig").QueryResult;
+const Client = zpg.client.Client;
+const ConnectOptions = zpg.options.ConnectOptions;
 
 pub fn main(init: std.process.Init) !void {
     const config = try Config.load(init.minimal.args, init.environ_map);
-    var client = try Client.init(init.io, init.gpa, config);
+    const opts = ConnectOptions{
+        .host = config.db_host,
+        .port = config.db_port,
+        .user = config.db_user,
+        .pass = config.db_pass,
+        .database = config.db_name,
+    };
+    var client = try Client.init(init.io, init.gpa, opts);
     defer client.deinit();
 
     if (try client.checkConnection()) {
@@ -20,5 +28,4 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("config.zig");
-    _ = @import("db/client.zig");
 }
