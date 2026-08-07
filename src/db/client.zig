@@ -8,10 +8,25 @@ const Config = config.Config;
 const QueryResult = @import("result.zig").QueryResult;
 const Oid = @import("oids.zig").Oid;
 
+pub const SessionContext = struct {
+    timezone_name: [64]u8,
+    timezone_offset_min: i16,
+    server_version: [64]u8,
+
+    pub fn getTimezone(self: *const SessionContext) []const u8 {
+        return std.mem.sliceTo(&self.timezone_name, 0);
+    }
+
+    pub fn getServerVersion(self: *const SessionContext) []const u8 {
+        return std.mem.sliceTo(&self.server_version, 0);
+    }
+};
+
 pub const Client = struct {
     pool: *pg.Pool,
     allocator: std.mem.Allocator,
     io: std.Io,
+    session_context: SessionContext,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, cfg: Config) !Client {
         const pool = try pg.Pool.init(io, allocator, .{ .size = 5, .connect_on_init_count = 1, .connect = .{
@@ -24,10 +39,21 @@ pub const Client = struct {
             .timeout = 10_000,
         } });
 
+        var tz_buf: [64]u8 = [_]u8{0} ** 64;
+        var ver_buf: [64]u8 = [_]u8{0} ** 64;
+
+        @memcpy(tz_buf[0..3], "UTC");
+        @memcpy(ver_buf[0..7], "unknown");
+
         return .{
             .pool = pool,
             .allocator = allocator,
             .io = io,
+            .session_context = .{
+                .timezone_name = tz_buf,
+                .timezone_offset_min = 0,
+                .server_version = ver_buf,
+            },
         };
     }
 
@@ -83,7 +109,7 @@ pub const Client = struct {
             while (try result.next()) |row| {
                 var cells = try allocator.alloc([]const u8, cols.len);
                 for (0..cols.len) |col_idx| {
-                    cells[col_idx] = try cellToString(allocator, row, col_idx);
+                    cells[col_idx] = try self.cellToString(allocator, row, col_idx);
                 }
                 try rows.append(allocator, cells);
             }
@@ -112,14 +138,47 @@ pub const Client = struct {
         };
     }
 
-    fn cellToString(allocator: std.mem.Allocator, row: pg.Row, col_idx: usize) ![]const u8 {
+    pub fn syncSessionContext(self: *Client) !void {
+        const query =
+            \\ SELECT
+            \\   current_setting('TimeZone'),
+            \\   (EXTRACT(timezone FROM now())::int4 / 60)::int2,
+            \\   current_setting('server_version')
+        ;
+
+        var result = try self.pool.query(query, .{});
+        defer result.deinit();
+
+        while (try result.next()) |row| {
+            const tz_name = try row.get([]const u8, 0);
+            const offset_min = try row.get(i16, 1);
+            const ver = try row.get([]const u8, 2);
+
+            var tz_buf: [64]u8 = [_]u8{0} ** 64;
+            var ver_buf: [64]u8 = [_]u8{0} ** 64;
+
+            const min_tz_len = @min(63, tz_name.len);
+            const min_ver_len = @min(63, ver.len);
+
+            @memcpy(tz_buf[0..min_tz_len], tz_name[0..min_tz_len]);
+            @memcpy(ver_buf[0..min_ver_len], ver[0..min_ver_len]);
+
+            self.session_context = .{
+                .timezone_name = tz_buf,
+                .timezone_offset_min = offset_min,
+                .server_version = ver_buf,
+            };
+        }
+    }
+
+    fn cellToString(self: *Client, allocator: std.mem.Allocator, row: pg.Row, col_idx: usize) ![]const u8 {
         if (row.values[col_idx].is_null) {
             return "[NULL]";
         }
 
         const oid: Oid = @enumFromInt(row.oids[col_idx]);
         return switch (oid) {
-            .char, .name, .text, .xml, .bpchar, .varchar, .json, .jsonb => {
+            .name, .text, .xml, .bpchar, .varchar, .json, .jsonb, .unknown, .char => {
                 const str = try row.get([]const u8, col_idx);
                 return try allocator.dupe(u8, str);
             },
@@ -152,6 +211,19 @@ pub const Client = struct {
             .inet, .cidr => {
                 const addr = try row.get(pg.Cidr, col_idx);
                 return formatCidr(allocator, addr, oid);
+            },
+            .bytea => {
+                const bytes = try row.get([]const u8, col_idx);
+                return formatBytea(allocator, bytes.len);
+            },
+            .timestamp => {
+                const ts = try row.get(i64, col_idx);
+                return formatTimestamp(allocator, ts, null);
+            },
+            .timestamptz => {
+                const ts = try row.get(i64, col_idx);
+                const offset = self.session_context.timezone_offset_min;
+                return formatTimestamp(allocator, ts, offset);
             },
             _ => {
                 return try std.fmt.allocPrint(allocator, "[OID {d}]", .{oid});
@@ -232,6 +304,88 @@ pub const Client = struct {
             }
         }
 
+        return allocator.dupe(u8, writer.buffered());
+    }
+
+    fn formatBytea(allocator: std.mem.Allocator, len: usize) ![]const u8 {
+        if (len < 1024) {
+            return std.fmt.allocPrint(allocator, "[BYTEA {d} B]", .{len});
+        }
+        const f_len = @as(f64, @floatFromInt(len));
+        if (len < 1024 * 1024) {
+            return std.fmt.allocPrint(allocator, "[BYTEA {d:.1} KiB]", .{f_len / 1024.0});
+        }
+        if (len < 1024 * 1024 * 1024) {
+            return std.fmt.allocPrint(allocator, "[BYTEA {d:.1} MiB]", .{f_len / (1024.0 * 1024.0)});
+        }
+        return std.fmt.allocPrint(allocator, "[BYTEA {d:.2} GiB]", .{f_len / (1024.0 * 1024.0 * 1024.0)});
+    }
+
+    fn formatTimestamp(allocator: std.mem.Allocator, usec: i64, tz_offset_minutes: ?i16) ![]const u8 {
+        var actual_usec = usec;
+        if (tz_offset_minutes) |offset| {
+            actual_usec += @as(i64, offset) * 60 * 1_000_000;
+        }
+
+        const total_sec = @divFloor(actual_usec, 1_000_000);
+        const rem_us = @mod(actual_usec, 1_000_000);
+
+        const cycle_secs: i64 = 12622780800;
+        const cycles = @divFloor(-total_sec, cycle_secs) + 1;
+        const pos_sec: u64 = @intCast(total_sec + cycles * cycle_secs);
+
+        const epoch_sec = std.time.epoch.EpochSeconds{ .secs = pos_sec };
+        const year_day = epoch_sec.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const day_sec = epoch_sec.getDaySeconds();
+
+        const year = year_day.year - @as(i32, @intCast(cycles * 400));
+
+        var buf: [40]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+
+        if (year <= 0) {
+            try writer.print("{d:0>4}-", .{
+                @as(u32, @intCast(1 - year)),
+            });
+        } else {
+            try writer.print("{d:0>4}-", .{
+                @as(u32, @intCast(year)),
+            });
+        }
+
+        try writer.print("{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_sec.getHoursIntoDay(),
+            day_sec.getMinutesIntoHour(),
+            day_sec.getSecondsIntoMinute(),
+        });
+
+        if (rem_us != 0) {
+            try writer.print(".{d:0>6}", .{@as(u32, @intCast(rem_us))});
+        }
+
+        if (tz_offset_minutes) |offset| {
+            if (offset == 0) {
+                try writer.writeAll("+00");
+            } else {
+                const abs_offset: u15 = @intCast(@abs(offset));
+                const hours = @divTrunc(abs_offset, 60);
+                const mins = @mod(abs_offset, 60);
+                const sign: u8 = if (offset >= 0) '+' else '-';
+
+                if (mins == 0) {
+                    try writer.print("{c}{d:0>2}", .{ sign, hours });
+                } else {
+                    try writer.print("{c}{d:0>2}:{d:0>2}", .{ sign, hours, mins });
+                }
+            }
+        }
+
+        if (year <= 0) {
+            try writer.writeAll(" BC");
+        }
         return allocator.dupe(u8, writer.buffered());
     }
 };
@@ -637,4 +791,660 @@ test "should correctly process casting null to cidr and inet" {
 
     try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
     try testing.expectEqualStrings("[NULL]", sel.rows[0][1]);
+}
+
+// "char" (OID 18)
+
+test "should return \"char\" value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT 'c'::"char"
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("c", sel.rows[0][0]);
+}
+
+test "should handle complex \"char\" cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    ''::"char",
+        \\    'qwerty'::"char",
+        \\    '7'::"char"
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("\x00", sel.rows[0][0]);
+    try testing.expectEqualStrings("q", sel.rows[0][1]);
+    try testing.expectEqualStrings("7", sel.rows[0][2]);
+}
+
+test "should correctly process casting null to \"char\"" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::\"char\"");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// bpchar
+
+test "should return bpchar value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT 'hello'::char(10)
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("hello     ", sel.rows[0][0]);
+}
+
+test "should handle complex bpchar cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    ''::char(5),
+        \\    'qwerty'::char(3),
+        \\    'тест'::char(6),
+        \\    'hello'::bpchar,
+        \\    '😃 Emoji 💁👌🎍😍'::bpchar(10)
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("     ", sel.rows[0][0]);
+    try testing.expectEqualStrings("qwe", sel.rows[0][1]);
+    try testing.expectEqualStrings("тест  ", sel.rows[0][2]);
+    try testing.expectEqualStrings("hello", sel.rows[0][3]);
+    try testing.expectEqualStrings("😃 Emoji 💁👌", sel.rows[0][4]);
+}
+
+test "should correctly process casting null to bpchar" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::char(10)");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// varchar
+
+test "should return varchar value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT 'hello'::varchar(10)
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("hello", sel.rows[0][0]);
+}
+
+test "should handle complex varchar cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    ''::varchar(5),
+        \\    'qwerty'::varchar(3),
+        \\    'тест'::varchar(6),
+        \\    'hello'::varchar,
+        \\    '😃 Emoji 💁👌🎍😍'::varchar(10)
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("", sel.rows[0][0]);
+    try testing.expectEqualStrings("qwe", sel.rows[0][1]);
+    try testing.expectEqualStrings("тест", sel.rows[0][2]);
+    try testing.expectEqualStrings("hello", sel.rows[0][3]);
+    try testing.expectEqualStrings("😃 Emoji 💁👌", sel.rows[0][4]);
+}
+
+test "should correctly process casting null to varchar" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::varchar(10)");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// text
+
+test "should return text value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT 'hello'::text
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("hello", sel.rows[0][0]);
+}
+
+test "should handle complex text cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    ''::text,
+        \\    'тест'::text,
+        \\    '😃 Emoji 💁👌'::text,
+        \\    E'line1\nline2\ttab'::text
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("", sel.rows[0][0]);
+    try testing.expectEqualStrings("тест", sel.rows[0][1]);
+    try testing.expectEqualStrings("😃 Emoji 💁👌", sel.rows[0][2]);
+    try testing.expectEqualStrings("line1\nline2\ttab", sel.rows[0][3]);
+}
+
+test "should correctly process casting null to text" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::text");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// name
+
+test "should return name value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT 'hello'::name
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("hello", sel.rows[0][0]);
+}
+
+test "should handle complex name cases and truncation at 63 bytes" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    ''::name,
+        \\    'тест'::name,
+        \\    'a123456789b123456789c123456789d123456789e123456789f123456789123456789'::name
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("", sel.rows[0][0]);
+    try testing.expectEqualStrings("тест", sel.rows[0][1]);
+    try testing.expectEqualStrings("a123456789b123456789c123456789d123456789e123456789f123456789123", sel.rows[0][2]);
+}
+
+test "should correctly process casting null to name" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::name");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// unknown
+
+test "should return unknown value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT 'hello'
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("hello", sel.rows[0][0]);
+}
+
+test "should handle complex unknown cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '',
+        \\    'тест'::unknown,
+        \\    '😃 Emoji 💁👌',
+        \\    E'line1\nline2'
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("", sel.rows[0][0]);
+    try testing.expectEqualStrings("тест", sel.rows[0][1]);
+    try testing.expectEqualStrings("😃 Emoji 💁👌", sel.rows[0][2]);
+    try testing.expectEqualStrings("line1\nline2", sel.rows[0][3]);
+}
+
+test "should correctly process casting null to unknown" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::unknown");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// xml
+
+test "should return xml value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT '<foo>bar</foo>'::xml
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("<foo>bar</foo>", sel.rows[0][0]);
+}
+
+test "should handle complex xml cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '<root attr="123"/>'::xml,
+        \\    '<user><name>Тест</name><status>active</status></user>'::xml,
+        \\    '<data>😃 Emoji 💁👌</data>'::xml,
+        \\    '<?xml version="1.0"?><note><!-- comment --><to>Tove</to></note>'::xml
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("<root attr=\"123\"/>", sel.rows[0][0]);
+    try testing.expectEqualStrings("<user><name>Тест</name><status>active</status></user>", sel.rows[0][1]);
+    try testing.expectEqualStrings("<data>😃 Emoji 💁👌</data>", sel.rows[0][2]);
+    try testing.expectEqualStrings("<note><!-- comment --><to>Tove</to></note>", sel.rows[0][3]);
+}
+
+test "should correctly process casting null to xml" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::xml");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+test "should return error payload on invalid xml syntax" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT '<unclosed>'::xml");
+    defer res.deinit();
+
+    try testing.expectEqual(.err, std.meta.activeTag(res.payload));
+
+    const err_data = res.payload.err;
+    try testing.expect(err_data.message.len > 0);
+}
+
+// json and jsonb
+
+test "should return json and jsonb values as strings" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT '{"name": "John", "age": 30}'::json, '{"name": "John", "age": 30}'::jsonb
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("{\"name\": \"John\", \"age\": 30}", sel.rows[0][0]);
+    try testing.expectEqualStrings("{\"age\": 30, \"name\": \"John\"}", sel.rows[0][1]);
+}
+
+test "should handle complex json and jsonb edge cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '[1, "two", true, null]'::json,
+        \\    '{"user": {"name": "Тест", "emoji": "😃"}}'::jsonb,
+        \\    '  {"spaces":   true}  '::json,
+        \\    '  {"spaces":   true}  '::jsonb,
+        \\    '{"a": 1, "a": 2}'::json,
+        \\    '{"a": 1, "a": 2}'::jsonb,
+        \\    '{}'::jsonb,
+        \\    '[]'::jsonb,
+        \\    '123.45'::jsonb,
+        \\    '"hello"'::jsonb,
+        \\    '"\u0422\u0435\u0441\u0442"'::jsonb
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[1, \"two\", true, null]", sel.rows[0][0]);
+    try testing.expectEqualStrings("{\"user\": {\"name\": \"Тест\", \"emoji\": \"😃\"}}", sel.rows[0][1]);
+    try testing.expectEqualStrings("  {\"spaces\":   true}  ", sel.rows[0][2]);
+    try testing.expectEqualStrings("{\"spaces\": true}", sel.rows[0][3]);
+    try testing.expectEqualStrings("{\"a\": 1, \"a\": 2}", sel.rows[0][4]);
+    try testing.expectEqualStrings("{\"a\": 2}", sel.rows[0][5]);
+    try testing.expectEqualStrings("{}", sel.rows[0][6]);
+    try testing.expectEqualStrings("[]", sel.rows[0][7]);
+    try testing.expectEqualStrings("123.45", sel.rows[0][8]);
+    try testing.expectEqualStrings("\"hello\"", sel.rows[0][9]);
+    try testing.expectEqualStrings("\"Тест\"", sel.rows[0][10]);
+}
+
+test "should correctly process casting null to json and jsonb" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::json, null::jsonb");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][1]);
+}
+
+test "should return error payload on invalid json syntax" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT '{bad_json: 123}'::json");
+    defer res.deinit();
+
+    try testing.expectEqual(.err, std.meta.activeTag(res.payload));
+
+    const err_data = res.payload.err;
+    try testing.expect(err_data.message.len > 0);
+}
+
+// bytea
+
+test "should return bytea value formatted with byte size" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '\xdeadbeef'::bytea,
+        \\    '\x0102030405'::bytea
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[BYTEA 4 B]", sel.rows[0][0]);
+    try testing.expectEqualStrings("[BYTEA 5 B]", sel.rows[0][1]);
+}
+
+test "should handle complex bytea cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '\x'::bytea,
+        \\    '\x00'::bytea,
+        \\    decode(repeat('ff', 1023), 'hex'),
+        \\    decode(repeat('ff', 1024), 'hex'),
+        \\    decode(repeat('ff', 1536), 'hex'),
+        \\    decode(repeat('ff', 1048576), 'hex'),
+        \\    convert_to('тест', 'UTF8'),
+        \\    convert_to('😃 Emoji 💁👌', 'UTF8')
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[BYTEA 0 B]", sel.rows[0][0]);
+    try testing.expectEqualStrings("[BYTEA 1 B]", sel.rows[0][1]);
+    try testing.expectEqualStrings("[BYTEA 1023 B]", sel.rows[0][2]);
+    try testing.expectEqualStrings("[BYTEA 1.0 KiB]", sel.rows[0][3]);
+    try testing.expectEqualStrings("[BYTEA 1.5 KiB]", sel.rows[0][4]);
+    try testing.expectEqualStrings("[BYTEA 1.0 MiB]", sel.rows[0][5]);
+    try testing.expectEqualStrings("[BYTEA 8 B]", sel.rows[0][6]);
+    try testing.expectEqualStrings("[BYTEA 19 B]", sel.rows[0][7]);
+}
+
+test "should correctly process casting null to bytea" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::bytea");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// timestamp
+
+test "should return timestamp value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT '2026-08-07 14:30:15'::timestamp
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("2026-08-07 14:30:15", sel.rows[0][0]);
+}
+
+test "should handle complex timestamp cases" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '1970-01-01 00:00:00'::timestamp,
+        \\    '1969-12-31 23:59:59.999999'::timestamp,
+        \\    '1950-05-15 08:30:00'::timestamp,
+        \\    '2024-02-29 23:59:59.000001'::timestamp,
+        \\    '2026-12-31 23:59:59'::timestamp,
+        \\    '0001-01-01 00:00:00'::timestamp,
+        \\    '0045-03-15 00:00:00 BC'::timestamp,
+        \\    '0001-01-01 00:00:00 BC'::timestamp
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("1970-01-01 00:00:00", sel.rows[0][0]);
+    try testing.expectEqualStrings("1969-12-31 23:59:59.999999", sel.rows[0][1]);
+    try testing.expectEqualStrings("1950-05-15 08:30:00", sel.rows[0][2]);
+    try testing.expectEqualStrings("2024-02-29 23:59:59.000001", sel.rows[0][3]);
+    try testing.expectEqualStrings("2026-12-31 23:59:59", sel.rows[0][4]);
+    try testing.expectEqualStrings("0001-01-01 00:00:00", sel.rows[0][5]);
+    try testing.expectEqualStrings("0045-03-15 00:00:00 BC", sel.rows[0][6]);
+    try testing.expectEqualStrings("0001-01-01 00:00:00 BC", sel.rows[0][7]);
+}
+
+test "should correctly process casting null to timestamp" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::timestamp");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// timestamptz
+
+test "should return timestamptz value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT '2026-08-07 14:30:15Z'::timestamptz
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("2026-08-07 14:30:15+00", sel.rows[0][0]);
+}
+
+test "should handle complex timestamptz edge cases and timezone offsets" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    {
+        var res = try client.execute(
+            \\ SELECT
+            \\    '1970-01-01 00:00:00Z'::timestamptz,
+            \\    '1969-12-31 23:59:59.999999Z'::timestamptz,
+            \\    '2024-02-29 12:00:00.123456Z'::timestamptz,
+            \\    '0045-03-15 00:00:00+00 BC'::timestamptz,
+            \\    '0001-01-01 00:00:00+00 BC'::timestamptz
+        );
+        defer res.deinit();
+
+        const sel = res.payload.select;
+        try testing.expectEqualStrings("1970-01-01 00:00:00+00", sel.rows[0][0]);
+        try testing.expectEqualStrings("1969-12-31 23:59:59.999999+00", sel.rows[0][1]);
+        try testing.expectEqualStrings("2024-02-29 12:00:00.123456+00", sel.rows[0][2]);
+        try testing.expectEqualStrings("0045-03-15 00:00:00+00 BC", sel.rows[0][3]);
+        try testing.expectEqualStrings("0001-01-01 00:00:00+00 BC", sel.rows[0][4]);
+    }
+
+    client.session_context.timezone_offset_min = 180;
+    {
+        var res = try client.execute(
+            \\ SELECT
+            \\    '2026-08-07 12:00:00+00'::timestamptz,
+            \\    '0045-03-15 00:00:00+00 BC'::timestamptz
+        );
+        defer res.deinit();
+
+        const sel = res.payload.select;
+        try testing.expectEqualStrings("2026-08-07 15:00:00+03", sel.rows[0][0]);
+        try testing.expectEqualStrings("0045-03-15 03:00:00+03 BC", sel.rows[0][1]);
+    }
+
+    client.session_context.timezone_offset_min = -300;
+    {
+        var res = try client.execute("SELECT '2026-08-07 02:00:00+00'::timestamptz");
+        defer res.deinit();
+
+        const sel = res.payload.select;
+        try testing.expectEqualStrings("2026-08-06 21:00:00-05", sel.rows[0][0]);
+    }
+
+    client.session_context.timezone_offset_min = 330;
+    {
+        var res = try client.execute("SELECT '2026-08-07 00:00:00.500000+00'::timestamptz");
+        defer res.deinit();
+
+        const sel = res.payload.select;
+        try testing.expectEqualStrings("2026-08-07 05:30:00.500000+05:30", sel.rows[0][0]);
+    }
+}
+
+test "should correctly process casting null to timestamptz" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::timestamptz");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
 }

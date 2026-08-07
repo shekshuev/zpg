@@ -12,6 +12,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Connected successfully.\n", .{});
     }
 
+    try client.syncSessionContext();
+    std.debug.print("Session synced.\n", .{});
+
     // TODO: for testing purpose, remove later
     //
 
@@ -27,7 +30,8 @@ pub fn main(init: std.process.Init) !void {
             \\    '192.168.1.50/24'::inet as ipv4_inet,
             \\    '192.168.1.0/24'::cidr as ipv4_cidr,
             \\    '2001:db8:85a3::8a2e:370:7334/64'::inet as ipv6_inet,
-            \\    '2001:db8:85a3::/64'::cidr as ipv6_cidr
+            \\    '2001:db8:85a3::/64'::cidr as ipv6_cidr,
+            \\    '0001-01-01 00:00:00'::timestamp
         );
         defer result.deinit();
         printQueryResult(result);

@@ -1,4 +1,5 @@
 pub const Oid = enum(u32) {
+    unknown = 705,
     bool = 16,
     // numbers
     int2 = 21,
@@ -16,21 +17,20 @@ pub const Oid = enum(u32) {
     varchar = 1043,
     json = 114,
     jsonb = 3802,
-    // ip
+    // net
     inet = 869,
     cidr = 650,
-    // inet_array = 1041,
-    // cidr_array = 651,
+    // macaddr8 = 774,
+    // macaddr = 829,
+
     // datetime
     // date = 1082,
     // time = 1083,
-    // timestamp = 1114,
-    // timestamptz = 1184,
+    timestamp = 1114,
+    timestamptz = 1184,
     // interval = 1186,
     // other
-    // bytea = 17,
-    // macaddr8 = 774,
-    // macaddr = 829,
+    bytea = 17,
 
     uuid = 2950,
     // xid = 28,
@@ -57,5 +57,7 @@ pub const Oid = enum(u32) {
     // jsonb_array = 3807,
     // uuid_array = 2951,
     // macaddr8_array = 775,
+    // inet_array = 1041,
+    // cidr_array = 651,
     _,
 };
