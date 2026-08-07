@@ -225,6 +225,18 @@ pub const Client = struct {
                 const offset = self.session_context.timezone_offset_min;
                 return formatTimestamp(allocator, ts, offset);
             },
+            .date => {
+                const bytes = try row.get([]const u8, col_idx);
+                return formatDate(allocator, bytes);
+            },
+            .time => {
+                const bytes = try row.get([]const u8, col_idx);
+                return formatTime(allocator, bytes);
+            },
+            .interval => {
+                const bytes = try row.get([]const u8, col_idx);
+                return formatInterval(allocator, bytes);
+            },
             _ => {
                 return try std.fmt.allocPrint(allocator, "[OID {d}]", .{oid});
             },
@@ -386,6 +398,105 @@ pub const Client = struct {
         if (year <= 0) {
             try writer.writeAll(" BC");
         }
+        return allocator.dupe(u8, writer.buffered());
+    }
+
+    fn formatDate(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+        const days_2000 = std.mem.readInt(i32, bytes[0..4], .big);
+        const days_from_1970_to_2000 = 10957;
+        const days_1970: i64 = @as(i64, days_2000) + days_from_1970_to_2000;
+
+        const cycle_days: i64 = 146097;
+        const cycles = @divFloor(-days_1970, cycle_days) + 1;
+        const pos_days: u64 = @intCast(days_1970 + cycles * cycle_days);
+
+        const epoch_day = std.time.epoch.EpochDay{ .day = @intCast(pos_days) };
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const year = year_day.year - @as(i32, @intCast(cycles * 400));
+
+        var buf: [14]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+
+        if (year <= 0) {
+            try writer.print("{d:0>4}-", .{@as(u32, @intCast(1 - year))});
+        } else {
+            try writer.print("{d:0>4}-", .{@as(u32, @intCast(year))});
+        }
+
+        try writer.print("{d:0>2}-{d:0>2}", .{
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+        });
+
+        if (year <= 0) {
+            try writer.writeAll(" BC");
+        }
+        return allocator.dupe(u8, writer.buffered());
+    }
+
+    fn formatTime(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+        const usec = std.mem.readInt(u64, bytes[0..8], .big);
+        const total_sec = @divFloor(usec, 1_000_000);
+        const rem_us = @mod(usec, 1_000_000);
+
+        const hours = @divFloor(total_sec, 3600);
+        const mins = @divFloor(@mod(total_sec, 3600), 60);
+        const secs = @mod(total_sec, 60);
+
+        var buf: [16]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+
+        try writer.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ hours, mins, secs });
+
+        if (rem_us != 0) {
+            try writer.print(".{d:0>6}", .{rem_us});
+        }
+        return allocator.dupe(u8, writer.buffered());
+    }
+
+    fn formatInterval(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+        const usec = std.mem.readInt(i64, bytes[0..8], .big);
+        const days = std.mem.readInt(i32, bytes[8..12], .big);
+        const months = std.mem.readInt(i32, bytes[12..16], .big);
+
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+
+        var has_prev = false;
+
+        if (months != 0) {
+            try writer.print("{d} mon{s}", .{ months, if (months != 1 and months != -1) "s" else "" });
+            has_prev = true;
+        }
+
+        if (days != 0) {
+            if (has_prev) try writer.writeByte(' ');
+            try writer.print("{d} day{s}", .{ days, if (days != 1 and days != -1) "s" else "" });
+            has_prev = true;
+        }
+
+        if (usec != 0 or !has_prev) {
+            if (has_prev) try writer.writeByte(' ');
+
+            if (usec < 0) {
+                try writer.writeByte('-');
+            }
+
+            const abs_us: u64 = @intCast(@abs(usec));
+            const total_sec = abs_us / 1_000_000;
+            const rem_us: u32 = @intCast(abs_us % 1_000_000);
+
+            const hours = total_sec / 3600;
+            const mins = (total_sec % 3600) / 60;
+            const secs = total_sec % 60;
+
+            try writer.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ hours, mins, secs });
+            if (rem_us != 0) {
+                try writer.print(".{d:0>6}", .{rem_us});
+            }
+        }
+
         return allocator.dupe(u8, writer.buffered());
     }
 };
@@ -1442,6 +1553,189 @@ test "should correctly process casting null to timestamptz" {
     defer client.deinit();
 
     var res = try client.execute("SELECT null::timestamptz");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// date
+
+test "should return date value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT '2026-08-07'::date
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("2026-08-07", sel.rows[0][0]);
+}
+
+test "should handle complex date cases including BC and leap years" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '2000-01-01'::date,
+        \\    '1970-01-01'::date,
+        \\    '1969-12-31'::date,
+        \\    '1950-05-15'::date,
+        \\    '2024-02-29'::date,
+        \\    '0001-01-01'::date,
+        \\    '0045-03-15 BC'::date,
+        \\    '0001-01-01 BC'::date
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("2000-01-01", sel.rows[0][0]);
+    try testing.expectEqualStrings("1970-01-01", sel.rows[0][1]);
+    try testing.expectEqualStrings("1969-12-31", sel.rows[0][2]);
+    try testing.expectEqualStrings("1950-05-15", sel.rows[0][3]);
+    try testing.expectEqualStrings("2024-02-29", sel.rows[0][4]);
+    try testing.expectEqualStrings("0001-01-01", sel.rows[0][5]);
+    try testing.expectEqualStrings("0045-03-15 BC", sel.rows[0][6]);
+    try testing.expectEqualStrings("0001-01-01 BC", sel.rows[0][7]);
+}
+
+test "should correctly process casting null to date" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::date");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// time
+
+test "should return time value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT '14:30:15'::time
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("14:30:15", sel.rows[0][0]);
+}
+
+test "should handle complex time cases including precision and 24:00:00" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '00:00:00'::time,
+        \\    '00:00:00.000001'::time,
+        \\    '12:34:56.789123'::time,
+        \\    '23:59:59.999999'::time,
+        \\    '24:00:00'::time
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("00:00:00", sel.rows[0][0]);
+    try testing.expectEqualStrings("00:00:00.000001", sel.rows[0][1]);
+    try testing.expectEqualStrings("12:34:56.789123", sel.rows[0][2]);
+    try testing.expectEqualStrings("23:59:59.999999", sel.rows[0][3]);
+    try testing.expectEqualStrings("24:00:00", sel.rows[0][4]);
+}
+
+test "should correctly process casting null to time" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::time");
+    defer res.deinit();
+
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("[NULL]", sel.rows[0][0]);
+}
+
+// interval
+
+test "should return interval value as string" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT '01:02:03'::interval
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("01:02:03", sel.rows[0][0]);
+}
+
+test "should handle complex interval cases including negatives, mixed signs and sub-second precision" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute(
+        \\ SELECT
+        \\    '00:00:00'::interval,
+        \\    '10 seconds'::interval,
+        \\    '1 day'::interval,
+        \\    '1 month 1 day 01:00:00'::interval,
+        \\    '1 year 2 months 3 days 04:05:06.789123'::interval,
+        \\    '2 years 5 days'::interval,
+        \\    '-1 day'::interval,
+        \\    '-1 month'::interval,
+        \\    '-01:30:00'::interval,
+        \\    '-2 days -05:15:00'::interval,
+        \\    '-1 month -3 days -04:05:06.123456'::interval,
+        \\    '1 month -5 days -02:00:00'::interval,
+        \\    '-00:00:00.500000'::interval,
+        \\    '1000 hours'::interval
+    );
+    defer res.deinit();
+
+    try testing.expectEqual(.select, std.meta.activeTag(res.payload));
+    const sel = res.payload.select;
+
+    try testing.expectEqualStrings("00:00:00", sel.rows[0][0]);
+    try testing.expectEqualStrings("00:00:10", sel.rows[0][1]);
+    try testing.expectEqualStrings("1 day", sel.rows[0][2]);
+    try testing.expectEqualStrings("1 mon 1 day 01:00:00", sel.rows[0][3]);
+    try testing.expectEqualStrings("14 mons 3 days 04:05:06.789123", sel.rows[0][4]);
+    try testing.expectEqualStrings("24 mons 5 days", sel.rows[0][5]);
+    try testing.expectEqualStrings("-1 day", sel.rows[0][6]);
+    try testing.expectEqualStrings("-1 mon", sel.rows[0][7]);
+    try testing.expectEqualStrings("-01:30:00", sel.rows[0][8]);
+    try testing.expectEqualStrings("-2 days -05:15:00", sel.rows[0][9]);
+    try testing.expectEqualStrings("-1 mon -3 days -04:05:06.123456", sel.rows[0][10]);
+    try testing.expectEqualStrings("1 mon -5 days -02:00:00", sel.rows[0][11]);
+    try testing.expectEqualStrings("-00:00:00.500000", sel.rows[0][12]);
+    try testing.expectEqualStrings("1000:00:00", sel.rows[0][13]);
+}
+
+test "should correctly process casting null to interval" {
+    var client = try setupTestClient(testing.allocator, testing.io);
+    defer client.deinit();
+
+    var res = try client.execute("SELECT null::interval");
     defer res.deinit();
 
     const sel = res.payload.select;

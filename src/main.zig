@@ -15,79 +15,7 @@ pub fn main(init: std.process.Init) !void {
     try client.syncSessionContext();
     std.debug.print("Session synced.\n", .{});
 
-    // TODO: for testing purpose, remove later
-    //
-
-    {
-        var result = try client.execute("SELECT * FROM accounts");
-        defer result.deinit();
-        printQueryResult(result);
-    }
-
-    {
-        var result = try client.execute(
-            \\SELECT
-            \\    '192.168.1.50/24'::inet as ipv4_inet,
-            \\    '192.168.1.0/24'::cidr as ipv4_cidr,
-            \\    '2001:db8:85a3::8a2e:370:7334/64'::inet as ipv6_inet,
-            \\    '2001:db8:85a3::/64'::cidr as ipv6_cidr,
-            \\    '0001-01-01 00:00:00'::timestamp
-        );
-        defer result.deinit();
-        printQueryResult(result);
-    }
-
-    {
-        var result = try client.execute("UPDATE accounts SET updated_at = NOW() WHERE id = 1");
-        defer result.deinit();
-        printQueryResult(result);
-    }
-
-    {
-        var result = try client.execute("UPDATE accounts SET updated_at = NOW() WHERE id = 1 returning id, type, status, updated_at");
-        defer result.deinit();
-        printQueryResult(result);
-    }
-
-    {
-        var result = try client.execute("SELECT * FROM non_existing_table_xyz");
-        defer result.deinit();
-        printQueryResult(result);
-    }
-
     std.debug.print("\nAll your {s} are belong to us.\n", .{"codebase"});
-}
-
-fn printQueryResult(result: QueryResult) void {
-    switch (result.payload) {
-        .select => |sel| {
-            std.debug.print("\n--- SELECT ({d} ms, {d} rows) ---\n", .{ sel.execution_time_ms, sel.rows.len });
-
-            for (sel.columns, 0..) |col, i| {
-                if (i > 0) std.debug.print(" | ", .{});
-                std.debug.print("{s}", .{col});
-            }
-            std.debug.print("\n", .{});
-
-            for (sel.rows) |row| {
-                for (row, 0..) |cell, i| {
-                    if (i > 0) std.debug.print(" | ", .{});
-                    std.debug.print("{s}", .{cell});
-                }
-                std.debug.print("\n", .{});
-            }
-        },
-
-        .command => |cmd| {
-            std.debug.print("\n--- COMMAND ({d} ms) ---\n", .{cmd.execution_time_ms});
-            std.debug.print("Status: {s} | Rows affected: {d}\n", .{ cmd.status, cmd.rows_affected });
-        },
-
-        .err => |err_data| {
-            std.debug.print("\n--- ERROR ({d} ms) ---\n", .{err_data.execution_time_ms});
-            std.debug.print("Message: {s}\n", .{err_data.message});
-        },
-    }
 }
 
 test {

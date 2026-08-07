@@ -24,11 +24,11 @@ pub const Oid = enum(u32) {
     // macaddr = 829,
 
     // datetime
-    // date = 1082,
-    // time = 1083,
+    date = 1082,
+    time = 1083,
     timestamp = 1114,
     timestamptz = 1184,
-    // interval = 1186,
+    interval = 1186,
     // other
     bytea = 17,
 
