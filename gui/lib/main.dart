@@ -1,69 +1,58 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'shared/ffi/engine.dart';
+import 'package:window_manager/window_manager.dart';
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 
-void main() {
-  runApp(const ZpgApp());
-}
+import 'app/theme.dart';
+import 'shared/models/db_connection.dart';
+import 'features/launcher/launcher_screen.dart';
+import 'features/studio/studio_screen.dart';
 
-class ZpgApp extends StatelessWidget {
-  const ZpgApp({super.key});
+void main(List<String> args) async {
+  WidgetsFlutterBinding.ensureInitialized();
 
-  @override
-  Widget build(BuildContext context) {
-    return const MaterialApp(
-      title: 'zpg Studio',
-      debugShowCheckedModeBanner: false,
-      home: ZpgMainScreen(),
-    );
-  }
-}
+  final windowController = await WindowController.fromCurrentEngine();
+  final rawArgs = windowController.arguments;
 
-class ZpgMainScreen extends StatefulWidget {
-  const ZpgMainScreen({super.key});
-
-  @override
-  State createState() => _ZpgMainScreenState();
-}
-
-class _ZpgMainScreenState extends State {
-  int? _result;
-
-  void _callZig() {
-    setState(() {
-      _result = zpgTestAdd(40, 2);
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('zpg Studio',
-            style: TextStyle(fontWeight: FontWeight.w600)),
-      ),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              'Answer from Zig: ${_result ?? "empty"}',
-              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 32),
-            ElevatedButton(
-              onPressed: _callZig,
-              style: ElevatedButton.styleFrom(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8)),
-              ),
-              child:
-                  const Text('40 + 2 via FFI', style: TextStyle(fontSize: 16)),
-            ),
-          ],
+  if (rawArgs.isNotEmpty) {
+    final connData = DbConnection.fromJson(jsonDecode(rawArgs));
+    runApp(
+      MaterialApp(
+        title: 'zpg Studio — ${connData.name}',
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.studioDarkTheme,
+        home: StudioScreen(
+          windowId: windowController.windowId,
+          connection: connData,
         ),
       ),
     );
+    return;
   }
+
+  await windowManager.ensureInitialized();
+
+  const windowOptions = WindowOptions(
+    size: Size(720, 480),
+    center: true,
+    titleBarStyle: TitleBarStyle.hidden,
+    skipTaskbar: false,
+  );
+
+  windowManager.waitUntilReadyToShow(windowOptions, () async {
+    await windowManager.setResizable(false);
+    await windowManager.setMaximizable(false);
+    await windowManager.setMinimizable(false);
+    await windowManager.show();
+    await windowManager.focus();
+  });
+
+  runApp(
+    MaterialApp(
+      title: 'zpg Studio',
+      debugShowCheckedModeBanner: false,
+      theme: AppTheme.darkTheme,
+      home: const LauncherScreen(),
+    ),
+  );
 }
